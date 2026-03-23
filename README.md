@@ -135,6 +135,18 @@ echo '/swapfile none swap sw 0 0' >> /etc/fstab
 ```
 </details>
 
+<details>
+<summary><b>Ubuntu 内存优化：关闭 snapd</b></summary>
+
+snapd 在 VPS 上完全用不到，常驻占 40-60MB 内存。关掉后 512MB 机器可用内存能从 ~190MB 提升到 ~200MB+：
+
+```bash
+systemctl stop snapd snapd.socket
+systemctl disable snapd snapd.socket
+apt purge -y snapd
+```
+</details>
+
 ## License
 
 [MIT](LICENSE)
