@@ -106,6 +106,35 @@ sb
 运行 `sb` 选 0，会清除所有文件、服务和 iptables 规则。
 </details>
 
+<details>
+<summary><b>不需要订阅服务，想节省内存？</b></summary>
+
+订阅服务常驻约 10MB 内存，个人使用可以关掉，直接复制节点链接到客户端即可：
+
+```bash
+# 停止并禁用
+systemctl stop sing-box-sub
+systemctl disable sing-box-sub
+
+# 以后想重新开启
+systemctl enable sing-box-sub --now
+```
+</details>
+
+<details>
+<summary><b>小内存 VPS（512MB）建议开启 swap</b></summary>
+
+sing-box 只占约 45MB 内存，512MB VPS 完全够用。但建议加一个 swap 作为安全网，防止极端情况下 OOM：
+
+```bash
+fallocate -l 256M /swapfile
+chmod 600 /swapfile
+mkswap /swapfile
+swapon /swapfile
+echo '/swapfile none swap sw 0 0' >> /etc/fstab
+```
+</details>
+
 ## License
 
 [MIT](LICENSE)
