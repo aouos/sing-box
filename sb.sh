@@ -48,9 +48,9 @@ get_ip() {
              || curl -4 -s --connect-timeout 5 https://ip.sb 2>/dev/null || echo "")
     if [[ -z "$SERVER_IP" ]]; then
         SERVER_IP=$(curl -6 -s --connect-timeout 5 https://api64.ipify.org 2>/dev/null || echo "")
-        [[ -n "$SERVER_IP" ]] && SERVER_IP="[$SERVER_IP]"
+        if [[ -n "$SERVER_IP" ]]; then SERVER_IP="[$SERVER_IP]"; fi
     fi
-    [[ -z "$SERVER_IP" ]] && err "无法获取公网 IP"
+    if [[ -z "$SERVER_IP" ]]; then err "无法获取公网 IP"; fi
 }
 
 random_port() {
@@ -84,10 +84,11 @@ install_singbox() {
     local VER
     VER=$(curl -fsSL "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null \
           | jq -r '.tag_name' 2>/dev/null | sed 's/^v//')
-    [[ -z "$VER" || "$VER" == "null" ]] && \
+    if [[ -z "$VER" || "$VER" == "null" ]]; then
         VER=$(curl -fsSL "https://data.jsdelivr.com/v1/package/gh/SagerNet/sing-box" 2>/dev/null \
               | grep -Eo '"[0-9]+\.[0-9]+\.[0-9]+",' | head -1 | tr -d '",')
-    [[ -z "$VER" ]] && err "获取版本号失败"
+    fi
+    if [[ -z "$VER" ]]; then err "获取版本号失败"; fi
 
     local URL="https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-${SB_ARCH}.tar.gz"
     local TMP="/tmp/sb-install-$$"
@@ -143,8 +144,8 @@ generate_config() {
     "log": { "level": "info", "timestamp": true },
     "dns": {
         "servers": [
-            { "tag": "google", "address": "tls://8.8.8.8" },
-            { "tag": "local", "address": "local" }
+            { "type": "tls", "tag": "google", "server": "8.8.8.8" },
+            { "type": "local", "tag": "local" }
         ]
     },
     "inbounds": [
@@ -194,12 +195,21 @@ generate_config() {
         }
     ],
     "outbounds": [
-        { "type": "direct", "tag": "direct" },
-        { "type": "block", "tag": "block" }
-    ]
+        { "type": "direct", "tag": "direct" }
+    ],
+    "route": {
+        "default_domain_resolver": "local"
+    }
 }
 EOF
-    "$BIN_PATH" check -c "$CONFIG_FILE" >/dev/null 2>&1 && info "配置验证通过" || err "配置验证失败"
+    if "$BIN_PATH" check -c "$CONFIG_FILE" 2>/tmp/sb-check.log; then
+        info "配置验证通过"
+    else
+        warn "配置验证失败:"
+        cat /tmp/sb-check.log
+        rm -f /tmp/sb-check.log
+        err "请检查配置"
+    fi
 }
 
 # ======================== 端口跳跃 ========================
@@ -442,9 +452,9 @@ check_ip_change() {
     NEW_IP=$(curl -4 -s --connect-timeout 3 https://api.ipify.org 2>/dev/null || echo "")
     if [[ -z "$NEW_IP" ]]; then
         NEW_IP=$(curl -6 -s --connect-timeout 3 https://api64.ipify.org 2>/dev/null || echo "")
-        [[ -n "$NEW_IP" ]] && NEW_IP="[$NEW_IP]"
+        if [[ -n "$NEW_IP" ]]; then NEW_IP="[$NEW_IP]"; fi
     fi
-    [[ -z "$NEW_IP" ]] && return
+    if [[ -z "$NEW_IP" ]]; then return; fi
 
     local OLD_CLEAN="${OLD_IP//[\[\]]/}"
     local NEW_CLEAN="${NEW_IP//[\[\]]/}"
@@ -564,8 +574,8 @@ cmd_regen_uuid() {
 cmd_vless_port() {
     load_info
     read -rp "  输入新端口 (当前 ${VLESS_PORT}): " np
-    [[ -z "$np" ]] && return
-    ss -tunlp 2>/dev/null | grep -q ":${np} " && { warn "端口 $np 被占用"; return; }
+    if [[ -z "$np" ]]; then return; fi
+    if ss -tunlp 2>/dev/null | grep -q ":${np} "; then warn "端口 $np 被占用"; return; fi
 
     jq --argjson p "$np" \
         '(.inbounds[] | select(.tag=="vless-reality") | .listen_port) = $p' \
@@ -613,7 +623,7 @@ cmd_sni() {
     load_info
     echo -e "  ${Y}常用伪装域名: www.microsoft.com  www.apple.com  www.amazon.com  www.cloudflare.com${N}"
     read -rp "  新伪装域名 (当前 ${REALITY_SNI}): " ns
-    [[ -z "$ns" ]] && return
+    if [[ -z "$ns" ]]; then return; fi
 
     jq --arg s "$ns" '
         (.inbounds[] | select(.tag=="vless-reality") | .tls.server_name) = $s |
@@ -672,7 +682,7 @@ cmd_status() {
 
 cmd_uninstall() {
     read -rp "  确认卸载? [y/N]: " yn
-    [[ "$yn" != [yY] ]] && return
+    if [[ "$yn" != [yY] ]]; then return; fi
 
     load_info
     iptables  -t nat -D PREROUTING -p udp --dport "${HY2_HOPPING_START:-20000}:${HY2_HOPPING_END:-40000}" \
@@ -690,9 +700,13 @@ cmd_uninstall() {
 
 # ======================== sb 快捷命令 ========================
 install_shortcut() {
-    local SELF
-    SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
-    cp -f "$SELF" "${WORK_DIR}/manage.sh"
+    # bash <(curl ...) 时 $0 是临时管道, 无法复制, 改为从 GitHub 下载
+    local SB_URL="https://raw.githubusercontent.com/aouos/sing-box/main/sb.sh"
+    if [[ -f "$0" ]]; then
+        cp -f "$0" "${WORK_DIR}/manage.sh"
+    else
+        curl -fsSL "$SB_URL" -o "${WORK_DIR}/manage.sh" || cp -f "$0" "${WORK_DIR}/manage.sh" 2>/dev/null || true
+    fi
     chmod +x "${WORK_DIR}/manage.sh"
 
     cat > "$SCRIPT_LINK" << 'SBEOF'
