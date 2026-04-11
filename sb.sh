@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
 # ═══════════════════════════════════════════════════════════════
-#  sing-box 一键部署 — VLESS-Reality(TCP) + Hysteria2(UDP 端口跳跃)
+#  sing-box 一键部署 — VLESS-Reality(TCP) + Hysteria2(UDP)
 #  适用: Ubuntu 20+ / Debian 11+ / CentOS 8+ (x86_64 / arm64)
-#  客户端: Shadowrocket (iOS) / v2rayNG (Android)
+#  客户端: Shadowrocket / v2rayNG / sing-box (全平台)
 #
-#  安装: bash <(curl -fsSL https://your-host/sb.sh)
+#  安装: bash <(curl -fsSL https://raw.githubusercontent.com/aouos/sing-box/main/sb.sh)
 #  管理: sb
 # ═══════════════════════════════════════════════════════════════
 
@@ -17,11 +17,10 @@ BIN_PATH="/usr/local/bin/sing-box"
 CONFIG_FILE="${WORK_DIR}/config.json"
 INFO_FILE="${WORK_DIR}/info.dat"
 SERVICE_FILE="/etc/systemd/system/sing-box.service"
-SUB_DIR="${WORK_DIR}/sub"
 SCRIPT_LINK="/usr/local/bin/sb"
 
 # ======================== 颜色 ========================
-R='\033[0;31m'; G='\033[0;32m'; Y='\033[0;33m'; B='\033[0;34m'
+R='\033[0;31m'; G='\033[0;32m'; Y='\033[0;33m'
 C='\033[0;36m'; W='\033[1;37m'; N='\033[0m'
 
 info()    { echo -e "  ${G}✓${N} $*"; }
@@ -30,8 +29,27 @@ err()     { echo -e "  ${R}✗${N} $*"; exit 1; }
 title()   { echo -e "\n${W}▶ $*${N}"; }
 line()    { echo -e "${C}─────────────────────────────────────────────────${N}"; }
 
-# ======================== 检测环境 ========================
-check_root() { if [[ $EUID -ne 0 ]]; then err "请使用 root 运行"; fi; }
+# ======================== 工具函数 ========================
+check_root() { [[ $EUID -eq 0 ]] || err "请使用 root 运行"; }
+
+valid_port() {
+    local p=$1
+    [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 ))
+}
+
+valid_host() {
+    local h=$1
+    (( ${#h} <= 253 )) || return 1
+    [[ "$h" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]]
+}
+
+jq_edit() {
+    # 首次修改前留一份备份, 由 apply_change 决定提交或回滚
+    [[ -f "${CONFIG_FILE}.bak" ]] || cp -f "$CONFIG_FILE" "${CONFIG_FILE}.bak"
+    local filter=$1; shift
+    jq "$@" "$filter" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" \
+        && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+}
 
 detect_arch() {
     case "$(uname -m)" in
@@ -42,15 +60,17 @@ detect_arch() {
     esac
 }
 
+fetch_ip() {
+    local ip
+    for url in https://api.ipify.org https://ifconfig.me https://ip.sb; do
+        ip=$(curl -4 -s --connect-timeout 5 "$url" 2>/dev/null || true)
+        [[ -n "$ip" ]] && { echo "$ip"; return; }
+    done
+}
+
 get_ip() {
-    SERVER_IP=$(curl -4 -s --connect-timeout 5 https://api.ipify.org 2>/dev/null \
-             || curl -4 -s --connect-timeout 5 https://ifconfig.me 2>/dev/null \
-             || curl -4 -s --connect-timeout 5 https://ip.sb 2>/dev/null || echo "")
-    if [[ -z "$SERVER_IP" ]]; then
-        SERVER_IP=$(curl -6 -s --connect-timeout 5 https://api64.ipify.org 2>/dev/null || echo "")
-        if [[ -n "$SERVER_IP" ]]; then SERVER_IP="[$SERVER_IP]"; fi
-    fi
-    if [[ -z "$SERVER_IP" ]]; then err "无法获取公网 IP"; fi
+    SERVER_IP=$(fetch_ip)
+    [[ -n "$SERVER_IP" ]] || err "无法获取公网 IPv4"
 }
 
 random_port() {
@@ -64,17 +84,50 @@ random_port() {
     done
 }
 
+show_qr() {
+    command -v qrencode &>/dev/null || return 0
+    qrencode -t ANSIUTF8 -m 2 "$1" 2>/dev/null || true
+}
+
+firewall_open() {
+    local proto=$1 port=$2
+    iptables -I INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || true
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
+        ufw allow "${port}/${proto}" >/dev/null 2>&1 || true
+    fi
+    if systemctl is-active --quiet firewalld 2>/dev/null; then
+        firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
+}
+
+firewall_close() {
+    local proto=$1 port=$2
+    [[ -z "$port" || "$port" == "0" ]] && return 0
+    iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || true
+    if command -v ufw &>/dev/null; then
+        ufw --force delete allow "${port}/${proto}" </dev/null >/dev/null 2>&1 || true
+    fi
+    if systemctl is-active --quiet firewalld 2>/dev/null; then
+        firewall-cmd --permanent --remove-port="${port}/${proto}" >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
+}
+
 # ======================== 安装依赖 ========================
 install_deps() {
     title "安装依赖"
     if command -v apt-get &>/dev/null; then
-        apt-get update -y -qq >/dev/null 2>&1
-        apt-get install -y -qq curl wget jq openssl tar gzip iptables python3 >/dev/null 2>&1
-    elif command -v yum &>/dev/null; then
-        yum install -y -q curl wget jq openssl tar gzip iptables python3 >/dev/null 2>&1
+        apt-get update -qq >/dev/null 2>&1
+        apt-get install -y -qq curl wget jq openssl tar gzip iptables iproute2 qrencode vnstat >/dev/null 2>&1
     elif command -v dnf &>/dev/null; then
-        dnf install -y -q curl wget jq openssl tar gzip iptables python3 >/dev/null 2>&1
+        dnf install -y -q epel-release >/dev/null 2>&1 || true
+        dnf install -y -q curl wget jq openssl tar gzip iptables iproute qrencode vnstat >/dev/null 2>&1
+    elif command -v yum &>/dev/null; then
+        yum install -y -q epel-release >/dev/null 2>&1 || true
+        yum install -y -q curl wget jq openssl tar gzip iptables iproute qrencode vnstat >/dev/null 2>&1
     fi
+    systemctl enable --now vnstat >/dev/null 2>&1 || true
     info "依赖就绪"
 }
 
@@ -105,7 +158,7 @@ install_singbox() {
 # ======================== 生成凭证 ========================
 generate_creds() {
     title "生成密钥与凭证"
-    mkdir -p "$WORK_DIR" "$SUB_DIR" "${WORK_DIR}/cert"
+    mkdir -p "${WORK_DIR}/cert"
 
     UUID=$("$BIN_PATH" generate uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)
     local KP
@@ -113,18 +166,11 @@ generate_creds() {
     PRIVATE_KEY=$(echo "$KP" | awk '/PrivateKey/{print $NF}')
     PUBLIC_KEY=$(echo "$KP" | awk '/PublicKey/{print $NF}')
     SHORT_ID=$(openssl rand -hex 8)
-    HY2_PASS=$(openssl rand -base64 16)
-    REALITY_SNI="www.microsoft.com"
+    HY2_PASS=$(openssl rand -hex 16)
+    REALITY_SNI="www.icloud.com"
 
-    # 端口
     VLESS_PORT=$(random_port)
     HY2_PORT=$(random_port)
-    SUB_PORT=$(random_port)
-    SUB_TOKEN=$(openssl rand -hex 16)
-
-    # Hysteria2 端口跳跃范围
-    HY2_HOPPING_START=20000
-    HY2_HOPPING_END=40000
 
     # 自签证书
     openssl ecparam -genkey -name prime256v1 -out "${WORK_DIR}/cert/key.pem" 2>/dev/null
@@ -133,7 +179,7 @@ generate_creds() {
 
     info "UUID: ${UUID}"
     info "VLESS 端口: ${VLESS_PORT} (TCP)"
-    info "HY2 实际端口: ${HY2_PORT} (UDP), 跳跃范围: ${HY2_HOPPING_START}-${HY2_HOPPING_END}"
+    info "HY2 端口: ${HY2_PORT} (UDP)"
 }
 
 # ======================== 配置文件 ========================
@@ -144,7 +190,6 @@ generate_config() {
     "log": { "level": "info", "timestamp": true },
     "dns": {
         "servers": [
-            { "type": "tls", "tag": "google", "server": "8.8.8.8" },
             { "type": "local", "tag": "local" }
         ]
     },
@@ -152,7 +197,7 @@ generate_config() {
         {
             "type": "vless",
             "tag": "vless-reality",
-            "listen": "::",
+            "listen": "0.0.0.0",
             "listen_port": ${VLESS_PORT},
             "users": [
                 {
@@ -178,7 +223,7 @@ generate_config() {
         {
             "type": "hysteria2",
             "tag": "hy2",
-            "listen": "::",
+            "listen": "0.0.0.0",
             "listen_port": ${HY2_PORT},
             "users": [
                 {
@@ -212,80 +257,11 @@ EOF
     fi
 }
 
-# ======================== 端口跳跃 ========================
-setup_port_hopping() {
-    title "配置 Hysteria2 端口跳跃"
-
-    # 清理旧规则 (忽略报错)
-    iptables  -t nat -D PREROUTING -p udp --dport "${HY2_HOPPING_START}:${HY2_HOPPING_END}" -j DNAT --to-destination ":${HY2_PORT}" 2>/dev/null || true
-    ip6tables -t nat -D PREROUTING -p udp --dport "${HY2_HOPPING_START}:${HY2_HOPPING_END}" -j DNAT --to-destination ":${HY2_PORT}" 2>/dev/null || true
-
-    # 新规则: UDP 20000-40000 → 实际 HY2 端口
-    iptables  -t nat -A PREROUTING -p udp --dport "${HY2_HOPPING_START}:${HY2_HOPPING_END}" -j DNAT --to-destination ":${HY2_PORT}" 2>/dev/null || true
-    ip6tables -t nat -A PREROUTING -p udp --dport "${HY2_HOPPING_START}:${HY2_HOPPING_END}" -j DNAT --to-destination ":${HY2_PORT}" 2>/dev/null || true
-
-    # 持久化
-    if command -v netfilter-persistent &>/dev/null; then
-        netfilter-persistent save 2>/dev/null || true
-    elif command -v iptables-save &>/dev/null; then
-        mkdir -p /etc/iptables
-        iptables-save  > /etc/iptables/rules.v4 2>/dev/null || true
-        ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
-    fi
-
-    # 开机恢复脚本
-    write_hopping_script
-
-    info "UDP ${HY2_HOPPING_START}-${HY2_HOPPING_END} → :${HY2_PORT} 端口跳跃已启用"
-}
-
-write_hopping_script() {
-    cat > "${WORK_DIR}/port-hopping.sh" << HEOF
-#!/bin/bash
-# 端口跳跃 DNAT 规则
-iptables  -t nat -C PREROUTING -p udp --dport ${HY2_HOPPING_START}:${HY2_HOPPING_END} -j DNAT --to-destination :${HY2_PORT} 2>/dev/null || \
-iptables  -t nat -A PREROUTING -p udp --dport ${HY2_HOPPING_START}:${HY2_HOPPING_END} -j DNAT --to-destination :${HY2_PORT}
-ip6tables -t nat -C PREROUTING -p udp --dport ${HY2_HOPPING_START}:${HY2_HOPPING_END} -j DNAT --to-destination :${HY2_PORT} 2>/dev/null || \
-ip6tables -t nat -A PREROUTING -p udp --dport ${HY2_HOPPING_START}:${HY2_HOPPING_END} -j DNAT --to-destination :${HY2_PORT}
-
-# 防火墙 INPUT 放行规则
-iptables  -C INPUT -p tcp --dport ${VLESS_PORT} -j ACCEPT 2>/dev/null || iptables  -I INPUT -p tcp --dport ${VLESS_PORT} -j ACCEPT
-ip6tables -C INPUT -p tcp --dport ${VLESS_PORT} -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p tcp --dport ${VLESS_PORT} -j ACCEPT
-iptables  -C INPUT -p udp --dport ${HY2_HOPPING_START}:${HY2_HOPPING_END} -j ACCEPT 2>/dev/null || iptables  -I INPUT -p udp --dport ${HY2_HOPPING_START}:${HY2_HOPPING_END} -j ACCEPT
-ip6tables -C INPUT -p udp --dport ${HY2_HOPPING_START}:${HY2_HOPPING_END} -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p udp --dport ${HY2_HOPPING_START}:${HY2_HOPPING_END} -j ACCEPT
-iptables  -C INPUT -p udp --dport ${HY2_PORT} -j ACCEPT 2>/dev/null || iptables  -I INPUT -p udp --dport ${HY2_PORT} -j ACCEPT
-ip6tables -C INPUT -p udp --dport ${HY2_PORT} -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p udp --dport ${HY2_PORT} -j ACCEPT
-iptables  -C INPUT -p tcp --dport ${SUB_PORT} -j ACCEPT 2>/dev/null || iptables  -I INPUT -p tcp --dport ${SUB_PORT} -j ACCEPT
-ip6tables -C INPUT -p tcp --dport ${SUB_PORT} -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p tcp --dport ${SUB_PORT} -j ACCEPT
-HEOF
-    chmod +x "${WORK_DIR}/port-hopping.sh"
-}
-
 # ======================== 防火墙 ========================
 setup_firewall() {
     title "配置防火墙"
-    local cmds=(
-        "-I INPUT -p tcp --dport $VLESS_PORT -j ACCEPT"
-        "-I INPUT -p udp --dport ${HY2_HOPPING_START}:${HY2_HOPPING_END} -j ACCEPT"
-        "-I INPUT -p udp --dport $HY2_PORT -j ACCEPT"
-        "-I INPUT -p tcp --dport $SUB_PORT -j ACCEPT"
-    )
-    for c in "${cmds[@]}"; do
-        iptables  $c 2>/dev/null || true
-        ip6tables $c 2>/dev/null || true
-    done
-
-    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
-        ufw allow "$VLESS_PORT"/tcp >/dev/null 2>&1 || true
-        ufw allow "${HY2_HOPPING_START}:${HY2_HOPPING_END}"/udp >/dev/null 2>&1 || true
-        ufw allow "$SUB_PORT"/tcp >/dev/null 2>&1 || true
-    fi
-    if systemctl is-active --quiet firewalld 2>/dev/null; then
-        firewall-cmd --permanent --add-port="$VLESS_PORT"/tcp >/dev/null 2>&1 || true
-        firewall-cmd --permanent --add-port="${HY2_HOPPING_START}-${HY2_HOPPING_END}"/udp >/dev/null 2>&1 || true
-        firewall-cmd --permanent --add-port="$SUB_PORT"/tcp >/dev/null 2>&1 || true
-        firewall-cmd --reload >/dev/null 2>&1 || true
-    fi
+    firewall_open tcp "$VLESS_PORT"
+    firewall_open udp "$HY2_PORT"
     info "防火墙已配置"
 }
 
@@ -311,7 +287,6 @@ After=network.target nss-lookup.target
 
 [Service]
 Type=simple
-ExecStartPre=/etc/sing-box/port-hopping.sh
 ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
 Restart=on-failure
 RestartSec=10
@@ -328,91 +303,31 @@ EOF
 
 # ======================== 生成链接 ========================
 generate_links() {
-    local IP="${SERVER_IP//[\[\]]/}"
-
-    # VLESS-Reality (TCP)
-    VLESS_LINK="vless://${UUID}@${IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#VLESS-Reality"
-
-    # Hysteria2 (UDP 端口跳跃)
-    HY2_LINK="hysteria2://${HY2_PASS}@${IP}:${HY2_PORT}?sni=bing.com&insecure=1&mport=${HY2_HOPPING_START}-${HY2_HOPPING_END}#Hysteria2"
-
-    echo "$VLESS_LINK" > "${SUB_DIR}/vless.txt"
-    echo "$HY2_LINK"   > "${SUB_DIR}/hy2.txt"
-
-    # 通用 Base64 订阅
-    printf "%s\n%s" "$VLESS_LINK" "$HY2_LINK" | base64 -w 0 > "${SUB_DIR}/sub.txt"
-}
-
-# ======================== 订阅服务 ========================
-setup_sub_server() {
-    title "启动订阅服务"
-    cat > "${WORK_DIR}/sub_server.py" << 'PYEOF'
-#!/usr/bin/env python3
-import http.server, sys, os
-PORT, TOKEN, DIR = int(sys.argv[1]), sys.argv[2], sys.argv[3]
-class H(http.server.BaseHTTPRequestHandler):
-    def log_message(self, *_): pass
-    def do_GET(self):
-        if self.path == f"/{TOKEN}":
-            fp = os.path.join(DIR, "sub.txt")
-            if os.path.isfile(fp):
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.send_header("Profile-Update-Interval", "6")
-                self.send_header("Subscription-Userinfo",
-                    "upload=0; download=0; total=107374182400; expire=0")
-                self.end_headers()
-                with open(fp, "rb") as f: self.wfile.write(f.read())
-                return
-        self.send_response(404); self.end_headers(); self.wfile.write(b"404")
-http.server.HTTPServer(("0.0.0.0", PORT), H).serve_forever()
-PYEOF
-
-    cat > /etc/systemd/system/sing-box-sub.service << SUBEOF
-[Unit]
-Description=sing-box subscription
-After=network.target
-[Service]
-Type=simple
-ExecStart=/usr/bin/python3 ${WORK_DIR}/sub_server.py ${SUB_PORT} ${SUB_TOKEN} ${SUB_DIR}
-Restart=on-failure
-RestartSec=5
-[Install]
-WantedBy=multi-user.target
-SUBEOF
-    systemctl daemon-reload
-    systemctl enable sing-box-sub --now >/dev/null 2>&1
-    sleep 1
-    systemctl is-active --quiet sing-box-sub && info "订阅服务端口: ${SUB_PORT}" || warn "订阅服务未启动"
+    VLESS_LINK="vless://${UUID}@${SERVER_IP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#VLESS-Reality"
+    HY2_LINK="hysteria2://${HY2_PASS}@${SERVER_IP}:${HY2_PORT}?sni=bing.com&insecure=1#Hysteria2"
 }
 
 # ======================== 保存配置 ========================
 save_info() {
-    cat > "$INFO_FILE" << EOF
-UUID="${UUID}"
-VLESS_PORT="${VLESS_PORT}"
-HY2_PORT="${HY2_PORT}"
-HY2_HOPPING_START="${HY2_HOPPING_START}"
-HY2_HOPPING_END="${HY2_HOPPING_END}"
-HY2_PASS="${HY2_PASS}"
-PUBLIC_KEY="${PUBLIC_KEY}"
-PRIVATE_KEY="${PRIVATE_KEY}"
-SHORT_ID="${SHORT_ID}"
-REALITY_SNI="${REALITY_SNI}"
-SERVER_IP="${SERVER_IP}"
-SUB_PORT="${SUB_PORT}"
-SUB_TOKEN="${SUB_TOKEN}"
-VLESS_LINK="${VLESS_LINK}"
-HY2_LINK="${HY2_LINK}"
-EOF
+    # 所有值使用 printf %q 做 shell 转义, 防止 source 时执行任意命令
+    {
+        printf 'UUID=%q\n'        "$UUID"
+        printf 'VLESS_PORT=%q\n'  "$VLESS_PORT"
+        printf 'HY2_PORT=%q\n'    "$HY2_PORT"
+        printf 'HY2_PASS=%q\n'    "$HY2_PASS"
+        printf 'PUBLIC_KEY=%q\n'  "$PUBLIC_KEY"
+        printf 'PRIVATE_KEY=%q\n' "$PRIVATE_KEY"
+        printf 'SHORT_ID=%q\n'    "$SHORT_ID"
+        printf 'REALITY_SNI=%q\n' "$REALITY_SNI"
+        printf 'SERVER_IP=%q\n'   "$SERVER_IP"
+        printf 'VLESS_LINK=%q\n'  "$VLESS_LINK"
+        printf 'HY2_LINK=%q\n'    "$HY2_LINK"
+    } > "$INFO_FILE"
     chmod 600 "$INFO_FILE"
 }
 
 # ======================== 显示结果 ========================
 show_result() {
-    local IP="${SERVER_IP//[\[\]]/}"
-    local SUB_URL="http://${IP}:${SUB_PORT}/${SUB_TOKEN}"
-
     echo ""
     echo -e "${W}╔══════════════════════════════════════════════════════╗${N}"
     echo -e "${W}║            ✓ 部署完成                                ║${N}"
@@ -422,18 +337,14 @@ show_result() {
     echo -e "  ${C}VLESS-Reality │ TCP${N}"
     line
     echo -e "  ${G}${VLESS_LINK}${N}"
-    echo ""
+    show_qr "$VLESS_LINK"
     line
-    echo -e "  ${C}Hysteria2 │ UDP 端口跳跃 ${HY2_HOPPING_START}-${HY2_HOPPING_END}${N}"
+    echo -e "  ${C}Hysteria2 │ UDP${N}"
     line
     echo -e "  ${G}${HY2_LINK}${N}"
-    echo ""
+    show_qr "$HY2_LINK"
     line
-    echo -e "  ${C}通用订阅 │ Shadowrocket / v2rayNG${N}"
-    line
-    echo -e "  ${G}${SUB_URL}${N}"
-    echo ""
-    line
+    echo -e "  ${Y}Shadowrocket / v2rayNG / sing-box 均支持直接粘贴或扫码导入${N}"
     echo -e "  ${Y}输入 ${W}sb${Y} 进入管理菜单${N}"
     line
     echo ""
@@ -447,31 +358,22 @@ load_info() { if [[ -f "$INFO_FILE" ]]; then source "$INFO_FILE"; fi; }
 
 # 检测 IP 变化并自动更新链接
 check_ip_change() {
-    local OLD_IP="$SERVER_IP"
-    local NEW_IP
-    NEW_IP=$(curl -4 -s --connect-timeout 3 https://api.ipify.org 2>/dev/null || echo "")
-    if [[ -z "$NEW_IP" ]]; then
-        NEW_IP=$(curl -6 -s --connect-timeout 3 https://api64.ipify.org 2>/dev/null || echo "")
-        if [[ -n "$NEW_IP" ]]; then NEW_IP="[$NEW_IP]"; fi
-    fi
-    if [[ -z "$NEW_IP" ]]; then return; fi
-
-    local OLD_CLEAN="${OLD_IP//[\[\]]/}"
-    local NEW_CLEAN="${NEW_IP//[\[\]]/}"
-    if [[ "$OLD_CLEAN" != "$NEW_CLEAN" ]]; then
-        warn "检测到 IP 变化: ${OLD_CLEAN} → ${NEW_CLEAN}"
-        SERVER_IP="$NEW_IP"
+    local NEW
+    NEW=$(fetch_ip)
+    [[ -z "$NEW" ]] && return
+    if [[ "$SERVER_IP" != "$NEW" ]]; then
+        warn "检测到 IP 变化: ${SERVER_IP} → ${NEW}"
+        SERVER_IP="$NEW"
         generate_links
         save_info
-        systemctl restart sing-box-sub 2>/dev/null || true
-        info "链接和订阅已自动更新"
+        info "链接已自动更新"
     fi
 }
 
 show_menu() {
+    check_root
     load_info
     check_ip_change
-    local IP="${SERVER_IP//[\[\]]/}"
     local SB_VER=$("$BIN_PATH" version 2>/dev/null | awk '/version/{print $NF}' || echo "?")
     local ST
     systemctl is-active --quiet sing-box 2>/dev/null && ST="${G}● 运行中${N}" || ST="${R}● 已停止${N}"
@@ -486,34 +388,32 @@ show_menu() {
     echo -e "${W}╚══════════════════════════════════════════════════════╝${N}"
     echo ""
     echo -e "  ${W}1.${N} 查看节点链接"
-    echo -e "  ${W}2.${N} 查看订阅地址"
-    echo -e "  ${W}3.${N} 重新生成 UUID"
-    echo -e "  ${W}4.${N} 修改 VLESS 端口"
-    echo -e "  ${W}5.${N} 修改 HY2 端口 & 跳跃范围"
-    echo -e "  ${W}6.${N} 修改 Reality 伪装域名"
-    echo -e "  ${W}7.${N} 更新 sing-box 内核"
-    echo -e "  ${W}8.${N} 重启服务"
+    echo -e "  ${W}2.${N} 重新生成 UUID"
+    echo -e "  ${W}3.${N} 修改 VLESS 端口"
+    echo -e "  ${W}4.${N} 修改 HY2 端口"
+    echo -e "  ${W}5.${N} 修改 Reality 伪装域名"
+    echo -e "  ${W}6.${N} 重启服务"
+    echo -e "  ${W}7.${N} 刷新 IP 并更新链接"
+    echo -e "  ${W}8.${N} 流量统计 (vnstat)"
     echo -e "  ${W}9.${N} 查看实时日志"
     echo -e "  ${W}10.${N} 服务状态详情"
-    echo -e "  ${W}11.${N} 刷新 IP 并更新链接"
     echo ""
     echo -e "  ${R}0.${N} 卸载"
     echo ""
-    read -rp "  请选择 [0-11]: " choice
+    read -rp "  请选择 [0-10]: " choice
     echo ""
 
     case "$choice" in
         1)  cmd_links ;;
-        2)  cmd_sub ;;
-        3)  cmd_regen_uuid ;;
-        4)  cmd_vless_port ;;
-        5)  cmd_hy2_port ;;
-        6)  cmd_sni ;;
-        7)  cmd_update ;;
-        8)  cmd_restart ;;
+        2)  cmd_regen_uuid ;;
+        3)  cmd_vless_port ;;
+        4)  cmd_hy2_port ;;
+        5)  cmd_sni ;;
+        6)  cmd_restart ;;
+        7)  cmd_refresh_ip ;;
+        8)  cmd_traffic ;;
         9)  cmd_log ;;
         10) cmd_status ;;
-        11) cmd_refresh_ip ;;
         0)  cmd_uninstall ;;
         *)  warn "无效选项" ;;
     esac
@@ -525,144 +425,132 @@ cmd_links() {
     line
     echo -e "  ${C}VLESS-Reality (TCP)${N}"
     line
-    echo ""
     echo -e "  ${G}${VLESS_LINK}${N}"
-    echo ""
+    show_qr "$VLESS_LINK"
     line
-    echo -e "  ${C}Hysteria2 (UDP 端口跳跃)${N}"
+    echo -e "  ${C}Hysteria2 (UDP)${N}"
     line
-    echo ""
     echo -e "  ${G}${HY2_LINK}${N}"
+    show_qr "$HY2_LINK"
+    echo -e "  ${Y}Shadowrocket / v2rayNG / sing-box 可直接粘贴或扫码导入${N}"
     echo ""
 }
 
-cmd_sub() {
-    load_info
-    local IP="${SERVER_IP//[\[\]]/}"
-    echo ""
-    line
-    echo -e "  ${C}通用订阅地址 (Shadowrocket / v2rayNG)${N}"
-    line
-    echo ""
-    echo -e "  ${G}http://${IP}:${SUB_PORT}/${SUB_TOKEN}${N}"
-    echo ""
-    echo -e "  ${Y}Shadowrocket: 首页 → 右上角 + → 类型选「Subscribe」→ 粘贴地址${N}"
-    echo -e "  ${Y}v2rayNG: 左上角 ≡ → 订阅分组设置 → 右上角 + → 粘贴地址${N}"
-    echo ""
+rollback_config() {
+    [[ -f "${CONFIG_FILE}.bak" ]] || return 1
+    mv -f "${CONFIG_FILE}.bak" "$CONFIG_FILE"
+    systemctl restart sing-box 2>/dev/null || true
+    sleep 1
+    systemctl is-active --quiet sing-box \
+        && info "已回滚到旧配置" \
+        || warn "回滚后仍异常, 查看: journalctl -u sing-box -n 50"
+}
+
+apply_change() {
+    # 先用 sing-box check 校验新配置, 失败直接回滚不重启
+    if ! "$BIN_PATH" check -c "$CONFIG_FILE" 2>/tmp/sb-check.log; then
+        warn "配置校验失败, 正在回滚:"
+        sed 's/^/    /' /tmp/sb-check.log
+        rm -f /tmp/sb-check.log
+        rollback_config
+        return 1
+    fi
+    rm -f /tmp/sb-check.log
+    get_ip; generate_links; save_info
+    if systemctl restart sing-box 2>/dev/null; then
+        sleep 1
+        if systemctl is-active --quiet sing-box; then
+            rm -f "${CONFIG_FILE}.bak"
+            return 0
+        fi
+    fi
+    warn "服务启动失败, 正在回滚配置"
+    rollback_config
+    generate_links; save_info
+    return 1
 }
 
 cmd_regen_uuid() {
     load_info
-    local NEW_UUID
-    NEW_UUID=$("$BIN_PATH" generate uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)
-
-    jq --arg u "$NEW_UUID" \
-        '(.inbounds[] | select(.tag=="vless-reality") | .users[0].uuid) = $u' \
-        "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
-
-    UUID="$NEW_UUID"
-    get_ip
-    generate_links
-    save_info
-    systemctl restart sing-box sing-box-sub 2>/dev/null || true
-
-    info "UUID 已更新: ${NEW_UUID}"
-    echo ""
-    cmd_links
+    local NEW
+    NEW=$("$BIN_PATH" generate uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)
+    jq_edit '(.inbounds[] | select(.tag=="vless-reality") | .users[0].uuid) = $u' --arg u "$NEW"
+    UUID="$NEW"
+    if apply_change; then
+        info "UUID 已更新: ${NEW}"
+        cmd_links
+    fi
 }
 
-cmd_vless_port() {
-    load_info
-    read -rp "  输入新端口 (当前 ${VLESS_PORT}): " np
-    if [[ -z "$np" ]]; then return; fi
-    if ss -tunlp 2>/dev/null | grep -q ":${np} "; then warn "端口 $np 被占用"; return; fi
+change_port() {
+    local tag=$1 proto=$2 cur_var=$3
+    local cur="${!cur_var}" np
+    read -rp "  输入新端口 (当前 ${cur}): " np
+    [[ -z "$np" ]] && return
+    valid_port "$np" || { warn "端口无效 (1-65535)"; return; }
+    ss -tunlp 2>/dev/null | grep -q ":${np} " && { warn "端口 $np 被占用"; return; }
 
-    jq --argjson p "$np" \
-        '(.inbounds[] | select(.tag=="vless-reality") | .listen_port) = $p' \
-        "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
-
-    iptables -I INPUT -p tcp --dport "$np" -j ACCEPT 2>/dev/null || true
-    VLESS_PORT="$np"
-    get_ip; generate_links; save_info
-    systemctl restart sing-box sing-box-sub 2>/dev/null || true
-    info "VLESS 端口 → ${np}"
-    cmd_links
+    jq_edit "(.inbounds[] | select(.tag==\"$tag\") | .listen_port) = \$p" --argjson p "$np"
+    printf -v "$cur_var" '%s' "$np"
+    if apply_change; then
+        # 服务成功切到新端口后再动防火墙: 先开新, 再删旧
+        firewall_open  "$proto" "$np"
+        firewall_close "$proto" "$cur"
+        info "端口 → ${np}"
+        cmd_links
+    else
+        # 回滚: 变量恢复成旧端口
+        printf -v "$cur_var" '%s' "$cur"
+    fi
 }
 
-cmd_hy2_port() {
-    load_info
-    read -rp "  HY2 监听端口 (当前 ${HY2_PORT}): " np
-    read -rp "  跳跃起始 (当前 ${HY2_HOPPING_START}): " ns
-    read -rp "  跳跃结束 (当前 ${HY2_HOPPING_END}): " ne
-    np=${np:-$HY2_PORT}; ns=${ns:-$HY2_HOPPING_START}; ne=${ne:-$HY2_HOPPING_END}
-
-    jq --argjson p "$np" \
-        '(.inbounds[] | select(.tag=="hy2") | .listen_port) = $p' \
-        "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
-
-    # 删旧规则
-    iptables  -t nat -D PREROUTING -p udp --dport "${HY2_HOPPING_START}:${HY2_HOPPING_END}" -j DNAT --to-destination ":${HY2_PORT}" 2>/dev/null || true
-    ip6tables -t nat -D PREROUTING -p udp --dport "${HY2_HOPPING_START}:${HY2_HOPPING_END}" -j DNAT --to-destination ":${HY2_PORT}" 2>/dev/null || true
-
-    HY2_PORT="$np"; HY2_HOPPING_START="$ns"; HY2_HOPPING_END="$ne"
-
-    # 加新规则
-    iptables  -t nat -A PREROUTING -p udp --dport "${ns}:${ne}" -j DNAT --to-destination ":${np}" 2>/dev/null || true
-    ip6tables -t nat -A PREROUTING -p udp --dport "${ns}:${ne}" -j DNAT --to-destination ":${np}" 2>/dev/null || true
-    iptables  -I INPUT -p udp --dport "${ns}:${ne}" -j ACCEPT 2>/dev/null || true
-    ip6tables -I INPUT -p udp --dport "${ns}:${ne}" -j ACCEPT 2>/dev/null || true
-
-    write_hopping_script
-    get_ip; generate_links; save_info
-    systemctl restart sing-box sing-box-sub 2>/dev/null || true
-    info "HY2 端口: ${np}, 跳跃: ${ns}-${ne}"
-    cmd_links
-}
+cmd_vless_port() { load_info; change_port vless-reality tcp VLESS_PORT; }
+cmd_hy2_port()   { load_info; change_port hy2          udp HY2_PORT;   }
 
 cmd_sni() {
     load_info
-    echo -e "  ${Y}常用伪装域名: www.microsoft.com  www.apple.com  www.amazon.com  www.cloudflare.com${N}"
+    echo -e "  ${Y}常用伪装域名: www.icloud.com  www.yahoo.com  www.apple.com  addons.mozilla.org${N}"
     read -rp "  新伪装域名 (当前 ${REALITY_SNI}): " ns
-    if [[ -z "$ns" ]]; then return; fi
+    [[ -z "$ns" ]] && return
+    valid_host "$ns" || { warn "域名格式非法"; return; }
 
-    jq --arg s "$ns" '
+    jq_edit '
         (.inbounds[] | select(.tag=="vless-reality") | .tls.server_name) = $s |
         (.inbounds[] | select(.tag=="vless-reality") | .tls.reality.handshake.server) = $s
-    ' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
-
+    ' --arg s "$ns"
     REALITY_SNI="$ns"
-    get_ip; generate_links; save_info
-    systemctl restart sing-box sing-box-sub 2>/dev/null || true
-    info "SNI → ${ns}"
-    cmd_links
+    if apply_change; then
+        info "SNI → ${ns}"
+        cmd_links
+    fi
 }
 
-cmd_update() {
-    detect_arch
-    install_singbox
-    systemctl restart sing-box
-    info "内核已更新"
+cmd_traffic() {
+    command -v vnstat &>/dev/null || { warn "vnstat 未安装"; return; }
+    echo ""
+    vnstat
+    echo ""
+    vnstat -d 2>/dev/null | tail -n 15
+    echo ""
 }
 
 cmd_refresh_ip() {
     load_info
-    local OLD_IP="${SERVER_IP//[\[\]]/}"
+    local OLD_IP="$SERVER_IP"
     get_ip
-    local NEW_IP="${SERVER_IP//[\[\]]/}"
-    if [[ "$OLD_IP" == "$NEW_IP" ]]; then
-        info "IP 未变化: ${NEW_IP}"
+    if [[ "$OLD_IP" == "$SERVER_IP" ]]; then
+        info "IP 未变化: ${SERVER_IP}"
         return
     fi
     generate_links
     save_info
-    systemctl restart sing-box-sub 2>/dev/null || true
-    info "IP 已更新: ${OLD_IP} → ${NEW_IP}"
+    info "IP 已更新: ${OLD_IP} → ${SERVER_IP}"
     echo ""
     cmd_links
 }
 
 cmd_restart() {
-    systemctl restart sing-box sing-box-sub 2>/dev/null || true
+    systemctl restart sing-box 2>/dev/null || true
     sleep 1
     systemctl is-active --quiet sing-box && info "服务已重启" || warn "重启异常"
 }
@@ -676,23 +564,20 @@ cmd_status() {
     echo ""
     systemctl status sing-box --no-pager 2>/dev/null
     echo ""
-    systemctl status sing-box-sub --no-pager 2>/dev/null
-    echo ""
 }
 
 cmd_uninstall() {
     read -rp "  确认卸载? [y/N]: " yn
-    if [[ "$yn" != [yY] ]]; then return; fi
+    [[ "$yn" == [yY] ]] || return
 
     load_info
-    iptables  -t nat -D PREROUTING -p udp --dport "${HY2_HOPPING_START:-20000}:${HY2_HOPPING_END:-40000}" \
-        -j DNAT --to-destination ":${HY2_PORT:-0}" 2>/dev/null || true
-    ip6tables -t nat -D PREROUTING -p udp --dport "${HY2_HOPPING_START:-20000}:${HY2_HOPPING_END:-40000}" \
-        -j DNAT --to-destination ":${HY2_PORT:-0}" 2>/dev/null || true
+    systemctl stop sing-box 2>/dev/null || true
+    systemctl disable sing-box 2>/dev/null || true
 
-    systemctl stop sing-box sing-box-sub 2>/dev/null || true
-    systemctl disable sing-box sing-box-sub 2>/dev/null || true
-    rm -rf "$WORK_DIR" "$SERVICE_FILE" /etc/systemd/system/sing-box-sub.service
+    firewall_close tcp "${VLESS_PORT:-}"
+    firewall_close udp "${HY2_PORT:-}"
+
+    rm -rf "$WORK_DIR" "$SERVICE_FILE"
     rm -f "$BIN_PATH" "$SCRIPT_LINK"
     systemctl daemon-reload
     info "卸载完成"
@@ -700,12 +585,17 @@ cmd_uninstall() {
 
 # ======================== sb 快捷命令 ========================
 install_shortcut() {
-    # bash <(curl ...) 时 $0 是临时管道, 无法复制, 改为从 GitHub 下载
+    # bash <(curl ...) 时 $0 是 /dev/fd/63 已被消费完, 这种情况下从 GitHub 重新下载
     local SB_URL="https://raw.githubusercontent.com/aouos/sing-box/main/sb.sh"
-    if [[ -f "$0" ]]; then
-        cp -f "$0" "${WORK_DIR}/manage.sh"
+    local SRC=""
+    if [[ -f "$0" && "$0" != /dev/fd/* && "$0" != /proc/* ]]; then
+        SRC=$(readlink -f "$0" 2>/dev/null || echo "$0")
+    fi
+    if [[ -n "$SRC" && -s "$SRC" ]]; then
+        cp -f "$SRC" "${WORK_DIR}/manage.sh"
     else
-        curl -fsSL "$SB_URL" -o "${WORK_DIR}/manage.sh" || cp -f "$0" "${WORK_DIR}/manage.sh" 2>/dev/null || true
+        curl -fsSL "$SB_URL" -o "${WORK_DIR}/manage.sh" \
+            || err "无法获取脚本本体, 请手动下载到 ${WORK_DIR}/manage.sh"
     fi
     chmod +x "${WORK_DIR}/manage.sh"
 
@@ -736,7 +626,7 @@ main() {
     echo ""
     echo -e "${W}╔══════════════════════════════════════════════════════╗${N}"
     echo -e "${W}║  sing-box 一键部署                                  ║${N}"
-    echo -e "${W}║  VLESS-Reality (TCP) + Hysteria2 (UDP 端口跳跃)     ║${N}"
+    echo -e "${W}║  VLESS-Reality (TCP) + Hysteria2 (UDP)              ║${N}"
     echo -e "${W}║  无需域名 · 无需证书 · 零配置                       ║${N}"
     echo -e "${W}╚══════════════════════════════════════════════════════╝${N}"
     echo ""
@@ -748,12 +638,10 @@ main() {
     install_singbox
     generate_creds
     generate_config
-    setup_port_hopping
     setup_firewall
     enable_bbr
     create_service
     generate_links
-    setup_sub_server
     save_info
     install_shortcut
     show_result
